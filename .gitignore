@@ -1,0 +1,58 @@
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (Never commit these!)
+*.pem
+*.key
+secrets.yaml
+*-secret.yaml
+.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+bin/
+obj/
+dist/
+build/
+
+# Test results
+TestResults/
+coverage/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Node modules (if any frontend)
+node_modules/
+
+# Python (if any scripts)
+__pycache__/
+*.pyc
+.venv/
+venv/

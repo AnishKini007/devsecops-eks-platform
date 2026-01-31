@@ -1,0 +1,296 @@
+// Jenkinsfile for CD Pipeline - Capstone DevSecOps Project
+// This pipeline deploys Kubernetes manifests to EKS and verifies deployments
+
+pipeline {
+    agent {
+        kubernetes {
+            label 'jenkins-agent-cd'
+            defaultContainer 'jnlp'
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins-agent: true
+spec:
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "devops"
+      effect: "NoSchedule"
+  nodeSelector:
+    role: devops
+  serviceAccountName: jenkins
+  containers:
+    - name: jnlp
+      image: jenkins/inbound-agent:latest
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "500m"
+        limits:
+          memory: "1Gi"
+          cpu: "1000m"
+    - name: kubectl
+      image: bitnami/kubectl:latest
+      command:
+        - cat
+      tty: true
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+    - name: aws-cli
+      image: amazon/aws-cli:latest
+      command:
+        - cat
+      tty: true
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+"""
+        }
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        EKS_CLUSTER_NAME = 'capstone-devsecops-eks-production'
+        APP_NAMESPACE = 'application'
+        DEPLOYMENT_NAME = 'capstone-dotnet-app'
+    }
+
+    parameters {
+        string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'Docker image tag to deploy')
+        choice(name: 'ENVIRONMENT', choices: ['staging', 'production'], description: 'Target environment')
+        booleanParam(name: 'DRY_RUN', defaultValue: false, description: 'Perform a dry run without actual deployment')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Configure AWS & Kubectl') {
+            steps {
+                container('aws-cli') {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                        sh """
+                            aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Pre-Deployment Validation') {
+            steps {
+                container('kubectl') {
+                    script {
+                        // Validate manifests
+                        sh """
+                            kubectl apply --dry-run=client -f kubernetes/app/ -n ${APP_NAMESPACE}
+                        """
+                        
+                        // Check namespace exists
+                        def nsExists = sh(
+                            script: "kubectl get namespace ${APP_NAMESPACE}",
+                            returnStatus: true
+                        )
+                        
+                        if (nsExists != 0) {
+                            sh "kubectl create namespace ${APP_NAMESPACE}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            when {
+                expression { return !params.DRY_RUN }
+            }
+            steps {
+                container('kubectl') {
+                    script {
+                        // Apply ConfigMaps and Secrets first
+                        sh """
+                            kubectl apply -f kubernetes/app/configmap.yaml -n ${APP_NAMESPACE} || true
+                            kubectl apply -f kubernetes/app/secret.yaml -n ${APP_NAMESPACE} || true
+                        """
+                        
+                        // Apply main deployment
+                        sh """
+                            kubectl apply -f kubernetes/app/ -n ${APP_NAMESPACE}
+                        """
+                        
+                        // Update image tag if specified
+                        if (params.IMAGE_TAG != 'latest') {
+                            sh """
+                                kubectl set image deployment/${DEPLOYMENT_NAME} \
+                                    ${DEPLOYMENT_NAME}=docker.io/\${DOCKERHUB_USERNAME}/capstone-dotnet-app:${params.IMAGE_TAG} \
+                                    -n ${APP_NAMESPACE}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            when {
+                expression { return !params.DRY_RUN }
+            }
+            steps {
+                container('kubectl') {
+                    script {
+                        // Wait for rollout to complete
+                        sh """
+                            kubectl rollout status deployment/${DEPLOYMENT_NAME} -n ${APP_NAMESPACE} --timeout=300s
+                        """
+                        
+                        // Get deployment info
+                        sh """
+                            echo "=== Deployment Status ==="
+                            kubectl get deployment ${DEPLOYMENT_NAME} -n ${APP_NAMESPACE}
+                            
+                            echo "=== Pod Status ==="
+                            kubectl get pods -l app=${DEPLOYMENT_NAME} -n ${APP_NAMESPACE}
+                            
+                            echo "=== Service Status ==="
+                            kubectl get svc -l app=${DEPLOYMENT_NAME} -n ${APP_NAMESPACE}
+                        """
+                        
+                        // Check pod health
+                        def podStatus = sh(
+                            script: """
+                                kubectl get pods -l app=${DEPLOYMENT_NAME} -n ${APP_NAMESPACE} \
+                                    -o jsonpath='{.items[*].status.phase}' | grep -v Running | wc -w
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (podStatus.toInteger() > 0) {
+                            error "Some pods are not in Running state"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Health Check') {
+            when {
+                expression { return !params.DRY_RUN }
+            }
+            steps {
+                container('kubectl') {
+                    script {
+                        // Get service endpoint
+                        def serviceIP = sh(
+                            script: """
+                                kubectl get svc ${DEPLOYMENT_NAME}-service -n ${APP_NAMESPACE} \
+                                    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || \
+                                kubectl get svc ${DEPLOYMENT_NAME}-service -n ${APP_NAMESPACE} \
+                                    -o jsonpath='{.spec.clusterIP}'
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        echo "Service endpoint: ${serviceIP}"
+                        
+                        // Perform health check (inside cluster)
+                        sh """
+                            kubectl run health-check-${BUILD_NUMBER} --rm -i --restart=Never \
+                                --image=curlimages/curl:latest \
+                                -n ${APP_NAMESPACE} \
+                                -- curl -s -o /dev/null -w "%{http_code}" \
+                                http://${DEPLOYMENT_NAME}-service.${APP_NAMESPACE}.svc.cluster.local/health || true
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Dry Run Summary') {
+            when {
+                expression { return params.DRY_RUN }
+            }
+            steps {
+                container('kubectl') {
+                    script {
+                        echo "=== DRY RUN SUMMARY ==="
+                        echo "Target Environment: ${params.ENVIRONMENT}"
+                        echo "Image Tag: ${params.IMAGE_TAG}"
+                        
+                        sh """
+                            echo "=== Resources to be applied ==="
+                            kubectl apply --dry-run=client -f kubernetes/app/ -n ${APP_NAMESPACE} -o yaml
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            emailext(
+                subject: "✅ CD Pipeline SUCCESS - Deployed to ${params.ENVIRONMENT}",
+                body: """
+                    <h2>Deployment Successful!</h2>
+                    <p><strong>Job:</strong> ${env.JOB_NAME}</p>
+                    <p><strong>Build Number:</strong> ${env.BUILD_NUMBER}</p>
+                    <p><strong>Environment:</strong> ${params.ENVIRONMENT}</p>
+                    <p><strong>Image Tag:</strong> ${params.IMAGE_TAG}</p>
+                    <p><strong>Dry Run:</strong> ${params.DRY_RUN}</p>
+                    <p><a href="${env.BUILD_URL}">View Build</a></p>
+                """,
+                to: '${DEFAULT_RECIPIENTS}',
+                mimeType: 'text/html'
+            )
+        }
+        failure {
+            emailext(
+                subject: "❌ CD Pipeline FAILED - ${params.ENVIRONMENT} Deployment",
+                body: """
+                    <h2>Deployment Failed!</h2>
+                    <p><strong>Job:</strong> ${env.JOB_NAME}</p>
+                    <p><strong>Build Number:</strong> ${env.BUILD_NUMBER}</p>
+                    <p><strong>Environment:</strong> ${params.ENVIRONMENT}</p>
+                    <p><strong>Image Tag:</strong> ${params.IMAGE_TAG}</p>
+                    <p><a href="${env.BUILD_URL}console">View Console Output</a></p>
+                    <h3>Rollback Instructions:</h3>
+                    <pre>kubectl rollout undo deployment/${DEPLOYMENT_NAME} -n ${APP_NAMESPACE}</pre>
+                """,
+                to: '${DEFAULT_RECIPIENTS}',
+                mimeType: 'text/html'
+            )
+            
+            // Automatic rollback on failure
+            container('kubectl') {
+                sh """
+                    echo "Initiating automatic rollback..."
+                    kubectl rollout undo deployment/${DEPLOYMENT_NAME} -n ${APP_NAMESPACE} || true
+                """
+            }
+        }
+    }
+}

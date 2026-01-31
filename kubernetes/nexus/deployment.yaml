@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nexus
+  namespace: devops-tools
+  labels:
+    app: nexus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nexus
+  template:
+    metadata:
+      labels:
+        app: nexus
+    spec:
+      nodeSelector:
+        role: devops
+      tolerations:
+        - key: "dedicated"
+          operator: "Equal"
+          value: "devops"
+          effect: "NoSchedule"
+      securityContext:
+        fsGroup: 200
+      containers:
+        - name: nexus
+          image: sonatype/nexus3:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8081
+              name: http
+            - containerPort: 8082
+              name: docker-hosted
+            - containerPort: 8083
+              name: docker-proxy
+          env:
+            - name: INSTALL4J_ADD_VM_PARAMS
+              value: "-Xms1g -Xmx2g -XX:MaxDirectMemorySize=2g"
+          resources:
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+            requests:
+              memory: "2Gi"
+              cpu: "1000m"
+          volumeMounts:
+            - name: nexus-data
+              mountPath: /nexus-data
+          livenessProbe:
+            httpGet:
+              path: /service/rest/v1/status
+              port: 8081
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /service/rest/v1/status
+              port: 8081
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 5
+      volumes:
+        - name: nexus-data
+          persistentVolumeClaim:
+            claimName: nexus-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-service
+  namespace: devops-tools
+  labels:
+    app: nexus
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+    - name: docker-hosted
+      port: 8082
+      targetPort: 8082
+    - name: docker-proxy
+      port: 8083
+      targetPort: 8083
+  selector:
+    app: nexus
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-lb
+  namespace: devops-tools
+  labels:
+    app: nexus
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8081
+    - name: docker-hosted
+      port: 8082
+      targetPort: 8082
+  selector:
+    app: nexus

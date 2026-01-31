@@ -1,0 +1,361 @@
+// Jenkinsfile for CI Pipeline - Capstone DevSecOps Project
+// This pipeline performs: Gitleaks, Trivy scans, .NET build, unit tests, SonarQube analysis, Docker build/scan/push
+
+pipeline {
+    agent {
+        kubernetes {
+            label 'jenkins-agent'
+            defaultContainer 'jnlp'
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins-agent: true
+spec:
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "devops"
+      effect: "NoSchedule"
+  nodeSelector:
+    role: devops
+  containers:
+    - name: jnlp
+      image: jenkins/inbound-agent:latest
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "500m"
+        limits:
+          memory: "1Gi"
+          cpu: "1000m"
+    - name: docker
+      image: docker:24-dind
+      securityContext:
+        privileged: true
+      env:
+        - name: DOCKER_TLS_CERTDIR
+          value: ""
+      volumeMounts:
+        - name: docker-socket
+          mountPath: /var/run
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "500m"
+        limits:
+          memory: "2Gi"
+          cpu: "2000m"
+    - name: dotnet
+      image: mcr.microsoft.com/dotnet/sdk:8.0
+      command:
+        - cat
+      tty: true
+      resources:
+        requests:
+          memory: "1Gi"
+          cpu: "500m"
+        limits:
+          memory: "2Gi"
+          cpu: "2000m"
+    - name: trivy
+      image: aquasec/trivy:latest
+      command:
+        - cat
+      tty: true
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "500m"
+        limits:
+          memory: "1Gi"
+          cpu: "1000m"
+    - name: gitleaks
+      image: zricethezav/gitleaks:latest
+      command:
+        - cat
+      tty: true
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+    - name: sonar-scanner
+      image: sonarsource/sonar-scanner-cli:latest
+      command:
+        - cat
+      tty: true
+      resources:
+        requests:
+          memory: "512Mi"
+          cpu: "500m"
+        limits:
+          memory: "1Gi"
+          cpu: "1000m"
+  volumes:
+    - name: docker-socket
+      emptyDir: {}
+"""
+        }
+    }
+
+    environment {
+        DOCKER_REGISTRY = 'docker.io'
+        DOCKER_IMAGE = "${DOCKER_REGISTRY}/${DOCKERHUB_USERNAME}/capstone-dotnet-app"
+        SONARQUBE_URL = 'http://sonarqube-service.devops-tools.svc.cluster.local:9000'
+        SONARQUBE_PROJECT_KEY = 'capstone-dotnet-app'
+        GIT_COMMIT_SHORT = sh(script: "printf \$(git rev-parse --short HEAD)", returnStdout: true)
+        BUILD_VERSION = "${BUILD_NUMBER}-${GIT_COMMIT_SHORT}"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        timeout(time: 1, unit: 'HOURS')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_MSG = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+                    env.GIT_AUTHOR = sh(script: 'git log -1 --pretty=%an', returnStdout: true).trim()
+                }
+            }
+        }
+
+        stage('Secret Detection - Gitleaks') {
+            steps {
+                container('gitleaks') {
+                    script {
+                        def gitleaksResult = sh(
+                            script: 'gitleaks detect --source=. --report-format=json --report-path=gitleaks-report.json --exit-code 0',
+                            returnStatus: true
+                        )
+                        if (gitleaksResult != 0) {
+                            echo "Warning: Gitleaks found potential secrets in the repository"
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('File System Scan - Trivy') {
+            steps {
+                container('trivy') {
+                    script {
+                        sh '''
+                            trivy fs --severity HIGH,CRITICAL \
+                                --format json \
+                                --output trivy-fs-report.json \
+                                --exit-code 0 \
+                                .
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-fs-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Restore Dependencies') {
+            steps {
+                container('dotnet') {
+                    sh 'dotnet restore'
+                }
+            }
+        }
+
+        stage('Build Application') {
+            steps {
+                container('dotnet') {
+                    sh 'dotnet build --configuration Release --no-restore'
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                container('dotnet') {
+                    sh '''
+                        dotnet test --configuration Release \
+                            --no-build \
+                            --logger "trx;LogFileName=test-results.trx" \
+                            --collect:"XPlat Code Coverage" \
+                            --results-directory ./TestResults
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'TestResults/**/*', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                container('sonar-scanner') {
+                    withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+                        sh """
+                            sonar-scanner \
+                                -Dsonar.projectKey=${SONARQUBE_PROJECT_KEY} \
+                                -Dsonar.sources=. \
+                                -Dsonar.host.url=${SONARQUBE_URL} \
+                                -Dsonar.login=${SONAR_TOKEN} \
+                                -Dsonar.cs.opencover.reportsPaths=TestResults/**/coverage.opencover.xml \
+                                -Dsonar.exclusions=**/obj/**,**/bin/**,**/*.test.cs
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                container('sonar-scanner') {
+                    timeout(time: 5, unit: 'MINUTES') {
+                        withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+                            script {
+                                def qgStatus = sh(
+                                    script: """
+                                        sleep 30
+                                        curl -s -u ${SONAR_TOKEN}: \
+                                            "${SONARQUBE_URL}/api/qualitygates/project_status?projectKey=${SONARQUBE_PROJECT_KEY}" \
+                                            | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4
+                                    """,
+                                    returnStdout: true
+                                ).trim()
+                                
+                                if (qgStatus != 'OK') {
+                                    echo "Quality Gate Status: ${qgStatus}"
+                                    // Uncomment to fail build on quality gate failure
+                                    // error "Quality Gate failed: ${qgStatus}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                container('docker') {
+                    script {
+                        sh """
+                            docker build -t ${DOCKER_IMAGE}:${BUILD_VERSION} .
+                            docker tag ${DOCKER_IMAGE}:${BUILD_VERSION} ${DOCKER_IMAGE}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Scan Docker Image - Trivy') {
+            steps {
+                container('trivy') {
+                    script {
+                        sh """
+                            trivy image --severity HIGH,CRITICAL \
+                                --format json \
+                                --output trivy-image-report.json \
+                                --exit-code 0 \
+                                ${DOCKER_IMAGE}:${BUILD_VERSION}
+                        """
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-image-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                container('docker') {
+                    withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                        sh """
+                            echo ${DOCKER_PASS} | docker login -u ${DOCKER_USER} --password-stdin
+                            docker push ${DOCKER_IMAGE}:${BUILD_VERSION}
+                            docker push ${DOCKER_IMAGE}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Update Kubernetes Manifests') {
+            steps {
+                container('jnlp') {
+                    withCredentials([usernamePassword(credentialsId: 'github-credentials', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                        sh """
+                            git config user.email "jenkins@capstone-devsecops.com"
+                            git config user.name "Jenkins CI"
+                            
+                            # Update image tag in deployment manifest
+                            sed -i 's|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:${BUILD_VERSION}|g' kubernetes/app/deployment.yaml
+                            
+                            git add kubernetes/app/deployment.yaml
+                            git commit -m "Update image tag to ${BUILD_VERSION}" || echo "No changes to commit"
+                            git push https://${GIT_USER}:${GIT_TOKEN}@github.com/${GIT_USER}/capstone-dotnet-app.git HEAD:main || echo "Push failed or nothing to push"
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            emailext(
+                subject: "✅ CI Pipeline SUCCESS - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    <h2>Build Successful!</h2>
+                    <p><strong>Job:</strong> ${env.JOB_NAME}</p>
+                    <p><strong>Build Number:</strong> ${env.BUILD_NUMBER}</p>
+                    <p><strong>Build Version:</strong> ${BUILD_VERSION}</p>
+                    <p><strong>Commit:</strong> ${env.GIT_COMMIT_MSG}</p>
+                    <p><strong>Author:</strong> ${env.GIT_AUTHOR}</p>
+                    <p><strong>Docker Image:</strong> ${DOCKER_IMAGE}:${BUILD_VERSION}</p>
+                    <p><a href="${env.BUILD_URL}">View Build</a></p>
+                """,
+                to: '${DEFAULT_RECIPIENTS}',
+                mimeType: 'text/html'
+            )
+        }
+        failure {
+            emailext(
+                subject: "❌ CI Pipeline FAILED - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    <h2>Build Failed!</h2>
+                    <p><strong>Job:</strong> ${env.JOB_NAME}</p>
+                    <p><strong>Build Number:</strong> ${env.BUILD_NUMBER}</p>
+                    <p><strong>Commit:</strong> ${env.GIT_COMMIT_MSG}</p>
+                    <p><strong>Author:</strong> ${env.GIT_AUTHOR}</p>
+                    <p><a href="${env.BUILD_URL}console">View Console Output</a></p>
+                """,
+                to: '${DEFAULT_RECIPIENTS}',
+                mimeType: 'text/html'
+            )
+        }
+    }
+}
