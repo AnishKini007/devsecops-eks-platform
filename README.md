@@ -276,17 +276,12 @@ kubectl get svc capstone-dotnet-app-lb -n application -o jsonpath='{.status.load
 - **CloudWatch** - AWS-native logging
 - **EKS Control Plane Logging** - API server, audit, scheduler logs
 
-## 🔄 Default Credentials (Change Immediately!)
+## 🔄 Credentials
 
-| Service | Username | Password |
-|---------|----------|----------|
-| Jenkins | admin | admin123 |
-| SonarQube | admin | admin |
-| Grafana | admin | admin123 |
-| MongoDB | root | rootpassword123 |
-| PostgreSQL | sonarqube | sonarqube123 |
-
-⚠️ **Important**: Change all default passwords before deploying to production!
+No real passwords are stored in this repository. The `secret.yaml` files under `kubernetes/` contain
+`CHANGE_ME_*` placeholders: replace them (or create the Secrets with `kubectl create secret`) before running
+`scripts/deploy-all.sh`, and set `JENKINS_ADMIN_PASSWORD` for Jenkins. SonarQube starts with `admin`/`admin`
+and forces a password change on first login.
 
 ## 🧹 Cleanup
 

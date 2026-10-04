@@ -17,7 +17,7 @@ data:
           users:
             - id: "admin"
               name: "Admin"
-              password: "${JENKINS_ADMIN_PASSWORD:-admin123}"
+              password: "${JENKINS_ADMIN_PASSWORD}"
       
       authorizationStrategy:
         globalMatrix:
